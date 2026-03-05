@@ -361,6 +361,12 @@ INTENTS = discord.Intents.default()
 client = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(client)
 
+@client.event
+async def setup_hook():
+    # discord.py v2: start background tasks here (safe async init hook)
+    client.radar_task = asyncio.create_task(radar_loop())
+
+
 async def ensure_category_and_channels(guild: discord.Guild) -> Dict[str, discord.TextChannel]:
     category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
     if category is None:
@@ -576,7 +582,6 @@ def main():
     if not DISCORD_TOKEN:
         raise SystemExit("Missing DISCORD_TOKEN env var.")
     _ = db()
-    client.loop.create_task(radar_loop())
     client.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
