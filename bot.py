@@ -1,843 +1,583 @@
+#!/usr/bin/env python3
+"""
+Free Radar (Discord bot)
+- Posts local freebies (Craigslist RSS with postal + radius)
+- Posts online freebies (RSS feeds + Epic free promos JSON)
+- Optional: Gmail ingestion for Facebook Marketplace notification emails (no scraping)
+
+Railway friendly:
+- Procfile worker: python bot.py
+- runtime.txt pins Python 3.12 (discord.py + Python 3.13 audioop removal issue)
+"""
+from __future__ import annotations
+
 import os
 import re
 import json
-import base64
-import sqlite3
+import time
 import asyncio
+import hashlib
+import logging
+import sqlite3
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
-from urllib.parse import urlencode
-
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+from typing import List, Dict, Tuple
 
 import aiohttp
 import feedparser
+import discord
+from discord import app_commands
 
-# Gmail API (official)
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+# ----------------------------
+# Config (env)
+# ----------------------------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# ==========================================================
-# CONFIG (set via Environment Variables on Railway)
-# ==========================================================
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
+ZIP = os.getenv("ZIP", "95673").strip()
+RADIUS_MILES = int((os.getenv("RADIUS_MILES", "20").strip() or "20"))
 
-DEFAULT_ZIP = os.environ.get("ZIP", "95673").strip()
-DEFAULT_RADIUS_MILES = int(os.environ.get("RADIUS_MILES", "20"))
+# Optional keyword filters (global; watchlist is per-server)
+INCLUDE_KEYWORDS = [k.strip().lower() for k in os.getenv("INCLUDE_KEYWORDS", "").split(",") if k.strip()]
+EXCLUDE_KEYWORDS = [k.strip().lower() for k in os.getenv("EXCLUDE_KEYWORDS", "").split(",") if k.strip()]
 
-POLL_SECONDS_LOCAL = int(os.environ.get("POLL_SECONDS_LOCAL", "180"))     # 3 min
-POLL_SECONDS_ONLINE = int(os.environ.get("POLL_SECONDS_ONLINE", "300"))   # 5 min
-POLL_SECONDS_GMAIL = int(os.environ.get("POLL_SECONDS_GMAIL", "180"))     # 3 min
+# Scheduling (seconds)
+LOCAL_INTERVAL = int(os.getenv("LOCAL_INTERVAL", "180"))   # 3 min
+ONLINE_INTERVAL = int(os.getenv("ONLINE_INTERVAL", "300")) # 5 min
+GMAIL_INTERVAL = int(os.getenv("GMAIL_INTERVAL", "180"))   # 3 min
 
-INCLUDE_KEYWORDS = [k.strip().lower() for k in os.environ.get("INCLUDE_KEYWORDS", "").split(",") if k.strip()]
-EXCLUDE_KEYWORDS = [k.strip().lower() for k in os.environ.get("EXCLUDE_KEYWORDS", "").split(",") if k.strip()]
-
-# On hosts with ephemeral disks, this DB may reset between deploys.
-# That only affects "seen" dedupe history.
-DB_PATH = os.environ.get("DB_PATH", "freebie_radar.db")
-
-SETUP_CATEGORY_NAME = "Freebie Radar"
-ROLE_LOCAL = "Freebie Radar Local"
-ROLE_ONLINE = "Freebie Radar Online"
-
-CHANNELS_TO_CREATE = [
-    ("free-local", "Local pickup freebies (Craigslist + FB Marketplace email alerts)."),
-    ("free-online", "Online freebies (Steam/Epic/GOG/Humble + Reddit + tech feeds)."),
-    ("requests", "Family requests: looking for ____."),
-    ("claimed-and-dead", "Claimed items + expired links."),
-]
-
-# Craigslist Sacramento free stuff
-CRAIGSLIST_BASE = "https://sacramento.craigslist.org/search/zip"
-
-# Steam sources
-STEAMDB_FREE_PROMOS_URL = "https://steamdb.info/upcoming/free/"
-
-# GamerPower API aggregator (Steam/Epic/GOG)
-GAMERPOWER_API = "https://www.gamerpower.com/api"
-
-# Reddit RSS subs (edit as you like)
-DEFAULT_REDDIT_SUBS = [
-    "GameDeals",
-    "FreeGameFindings",
-    "FreeGamesOnSteam",
-    "epicgamespc",
-    "gog",
-    "humblebundles",
-    "Gamebundles",
-    "AppHookup",
-    "freebies",
-    "software",
-]
-
-# Tech/software giveaway RSS feeds (best-effort; add/remove later)
-DEFAULT_TECH_RSS = [
-    "https://blog.humblebundle.com/rss",
-    "https://www.epicbundle.com/feed/",
-    "https://www.makeuseof.com/tag/freebies/feed/",
-]
-
-# Gmail integration (Facebook Marketplace notifications land in Gmail)
-# Uses Gmail API read-only. No scraping Marketplace.
-GMAIL_ENABLED = os.environ.get("GMAIL_ENABLED", "0").strip() == "1"
-# Put the token JSON string in an env var (Railway-friendly)
-GMAIL_TOKEN_JSON = os.environ.get("GMAIL_TOKEN_JSON", "").strip()
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-GMAIL_QUERY = os.environ.get(
+# Optional Gmail ingestion
+GMAIL_ENABLED = os.getenv("GMAIL_ENABLED", "0").strip() == "1"
+GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON", "").strip()
+GMAIL_QUERY = os.getenv(
     "GMAIL_QUERY",
-    'from:facebookmail.com (marketplace OR subject:Marketplace) newer_than:14d'
+    "from:facebookmail.com (marketplace OR subject:Marketplace) newer_than:14d"
 ).strip()
 
-# Match Marketplace item URLs in email bodies
-FB_MARKET_ITEM_RE = re.compile(r"https?://(?:www\.)?facebook\.com/marketplace/item/\d+", re.IGNORECASE)
-# Facebook email links sometimes use redirectors
-FB_REDIRECT_RE = re.compile(r"https?://l\.facebook\.com/l\.php\?[^ \n\r\t>]+", re.IGNORECASE)
+# Discord structure
+CATEGORY_NAME = "Free Radar"
 
-PRICE_RE = re.compile(r"\$(\d+)", re.IGNORECASE)
+CH_FREE_LOCAL = "free-local"
+CH_FREE_GAMES = "free-games"
+CH_FREE_SOFTWARE = "free-software"
+CH_AI_TOOLS = "ai-tools"
+CH_REQUESTS = "requests"
+CH_CLAIMED = "claimed-and-dead"
 
+ROLE_LOCAL = "Free Radar Local"
+ROLE_ONLINE = "Free Radar Online"
 
-# ==========================================================
-# MODELS
-# ==========================================================
+DB_PATH = os.getenv("DB_PATH", "data.db").strip()
+
+# Craigslist region (change if you want)
+CRAIGSLIST_SITE = os.getenv("CRAIGSLIST_SITE", "sacramento").strip()
+
+# Epic free games JSON endpoint
+EPIC_FREE_GAMES_JSON = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US"
+
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("free-radar")
+
+# ----------------------------
+# Data model
+# ----------------------------
 @dataclass
-class Listing:
+class RadarItem:
     title: str
-    link: str
-    published: str = ""
-    where: Optional[str] = None
-    price: Optional[str] = None
-    source: Optional[str] = None
-    extra: Optional[str] = None
+    url: str
+    source: str
+    channel_key: str  # local, games, software, ai
+    summary: str = ""
+    score: int = 0
 
-
-# ==========================================================
-# DATABASE
-# ==========================================================
+# ----------------------------
+# Database (sqlite)
+# ----------------------------
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS posted (
+            guild_id TEXT NOT NULL,
+            url_hash TEXT NOT NULL,
+            url TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, url_hash)
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS watch (
+            guild_id TEXT NOT NULL,
+            keyword TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, keyword)
+        );
+    """)
+    con.commit()
+    return con
 
-def init_db():
-    conn = db()
-    cur = conn.cursor()
+def url_hash(url: str) -> str:
+    return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS guild_config (
-            guild_id INTEGER PRIMARY KEY,
-            zip TEXT NOT NULL,
-            radius_miles INTEGER NOT NULL,
-            category_id INTEGER,
-            channel_local_id INTEGER,
-            channel_online_id INTEGER,
-            role_local_id INTEGER,
-            role_online_id INTEGER,
-            updated_ts INTEGER DEFAULT (strftime('%s','now'))
+def already_posted(guild_id: int, url: str) -> bool:
+    h = url_hash(url)
+    with db() as con:
+        cur = con.execute("SELECT 1 FROM posted WHERE guild_id=? AND url_hash=? LIMIT 1", (str(guild_id), h))
+        return cur.fetchone() is not None
+
+def mark_posted(guild_id: int, url: str) -> None:
+    h = url_hash(url)
+    with db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO posted (guild_id, url_hash, url, created_ts) VALUES (?,?,?,?)",
+            (str(guild_id), h, url, int(time.time()))
         )
-        """
-    )
+        con.commit()
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS seen_links (
-            guild_id INTEGER NOT NULL,
-            feed_type TEXT NOT NULL,
-            link TEXT NOT NULL,
-            first_seen_ts INTEGER DEFAULT (strftime('%s','now')),
-            PRIMARY KEY (guild_id, feed_type, link)
+def get_watchlist(guild_id: int) -> List[str]:
+    with db() as con:
+        cur = con.execute("SELECT keyword FROM watch WHERE guild_id=? ORDER BY keyword", (str(guild_id),))
+        return [r[0] for r in cur.fetchall()]
+
+def add_watch(guild_id: int, keyword: str) -> None:
+    keyword = keyword.strip().lower()
+    if not keyword:
+        return
+    with db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO watch (guild_id, keyword, created_ts) VALUES (?,?,?)",
+            (str(guild_id), keyword, int(time.time()))
         )
-        """
-    )
+        con.commit()
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS custom_rss (
-            guild_id INTEGER NOT NULL,
-            feed_url TEXT NOT NULL,
-            kind TEXT NOT NULL, -- 'online'
-            PRIMARY KEY (guild_id, feed_url)
-        )
-        """
-    )
+def remove_watch(guild_id: int, keyword: str) -> bool:
+    keyword = keyword.strip().lower()
+    with db() as con:
+        cur = con.execute("DELETE FROM watch WHERE guild_id=? AND keyword=?", (str(guild_id), keyword))
+        con.commit()
+        return cur.rowcount > 0
 
-    conn.commit()
-    conn.close()
+# ----------------------------
+# Filtering + scoring
+# ----------------------------
+def normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-def upsert_guild_config(
-    guild_id: int,
-    zip_code: str,
-    radius_miles: int,
-    category_id: int,
-    channel_local_id: int,
-    channel_online_id: int,
-    role_local_id: int,
-    role_online_id: int,
-):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO guild_config (
-            guild_id, zip, radius_miles, category_id,
-            channel_local_id, channel_online_id,
-            role_local_id, role_online_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(guild_id) DO UPDATE SET
-            zip=excluded.zip,
-            radius_miles=excluded.radius_miles,
-            category_id=excluded.category_id,
-            channel_local_id=excluded.channel_local_id,
-            channel_online_id=excluded.channel_online_id,
-            role_local_id=excluded.role_local_id,
-            role_online_id=excluded.role_online_id,
-            updated_ts=(strftime('%s','now'))
-        """,
-        (
-            guild_id, zip_code, radius_miles, category_id,
-            channel_local_id, channel_online_id,
-            role_local_id, role_online_id
-        )
-    )
-    conn.commit()
-    conn.close()
-
-def get_all_guild_configs() -> List[Dict[str, Any]]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT guild_id, zip, radius_miles, category_id,
-               channel_local_id, channel_online_id,
-               role_local_id, role_online_id
-        FROM guild_config
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    out = []
-    for r in rows:
-        out.append({
-            "guild_id": int(r[0]),
-            "zip": str(r[1]),
-            "radius_miles": int(r[2]),
-            "category_id": int(r[3]) if r[3] else None,
-            "channel_local_id": int(r[4]) if r[4] else None,
-            "channel_online_id": int(r[5]) if r[5] else None,
-            "role_local_id": int(r[6]) if r[6] else None,
-            "role_online_id": int(r[7]) if r[7] else None,
-        })
-    return out
-
-def already_seen(guild_id: int, feed_type: str, link: str) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM seen_links WHERE guild_id=? AND feed_type=? AND link=?",
-        (guild_id, feed_type, link)
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-def mark_seen(guild_id: int, feed_type: str, link: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO seen_links (guild_id, feed_type, link) VALUES (?, ?, ?)",
-        (guild_id, feed_type, link)
-    )
-    conn.commit()
-    conn.close()
-
-def add_custom_rss(guild_id: int, feed_url: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO custom_rss (guild_id, feed_url, kind) VALUES (?, ?, 'online')",
-        (guild_id, feed_url)
-    )
-    conn.commit()
-    conn.close()
-
-def list_custom_rss(guild_id: int) -> List[str]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT feed_url FROM custom_rss WHERE guild_id=? AND kind='online' ORDER BY feed_url",
-        (guild_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-
-# ==========================================================
-# FILTERS / EMBEDS
-# ==========================================================
-def extract_price(title: str) -> Optional[str]:
-    m = PRICE_RE.search(title)
-    if m:
-        return f"${m.group(1)}"
-    if "free" in title.lower():
-        return "FREE"
-    return None
-
-def passes_filters(text: str) -> bool:
+def passes_global_filters(text: str) -> bool:
     t = text.lower()
+    if INCLUDE_KEYWORDS and not any(k in t for k in INCLUDE_KEYWORDS):
+        return False
     if EXCLUDE_KEYWORDS and any(k in t for k in EXCLUDE_KEYWORDS):
         return False
-    if INCLUDE_KEYWORDS:
-        return any(k in t for k in INCLUDE_KEYWORDS)
     return True
 
-def make_embed(listing: Listing) -> discord.Embed:
-    title = (listing.title or "Free item")[:256]
-    embed = discord.Embed(title=title, url=listing.link)
+def compute_score(title: str, summary: str) -> int:
+    t = (title + " " + summary).lower()
+    score = 0
+    if "free" in t:
+        score += 20
+    if any(w in t for w in ["brand new", "sealed", "unused", "new in box", "nib"]):
+        score += 10
+    if any(w in t for w in ["gaming", "laptop", "pc", "monitor", "iphone", "ipad", "ps5", "xbox", "switch"]):
+        score += 8
+    if any(w in t for w in ["couch", "sofa", "dresser", "table", "chair", "desk", "bed"]):
+        score += 6
+    if any(w in t for w in ["iso", "wanted", "looking for", "trade", "swap"]):
+        score -= 20
+    if any(w in t for w in ["broken", "for parts", "not working", "junk"]):
+        score -= 12
+    if "$" in t:
+        score -= 4
+    return score
 
-    if listing.price:
-        embed.add_field(name="Price", value=listing.price, inline=True)
-    if listing.where:
-        embed.add_field(name="Area", value=str(listing.where)[:1024], inline=True)
-    if listing.source:
-        embed.add_field(name="Source", value=str(listing.source)[:1024], inline=True)
-    if listing.extra:
-        embed.add_field(name="Details", value=str(listing.extra)[:1024], inline=False)
-    if listing.published:
-        embed.set_footer(text=f"Posted: {listing.published[:100]}")
-    return embed
+def watch_hit(guild_id: int, item: RadarItem) -> bool:
+    wl = get_watchlist(guild_id)
+    if not wl:
+        return False
+    hay = (item.title + " " + item.summary).lower()
+    return any(k in hay for k in wl)
 
+# ----------------------------
+# Sources
+# ----------------------------
+def craigslist_free_rss(postal: str, radius: int) -> str:
+    return f"https://{CRAIGSLIST_SITE}.craigslist.org/search/zip?postal={postal}&search_distance={radius}&format=rss"
 
-# ==========================================================
-# FETCH HELPERS
-# ==========================================================
+def rss_sources() -> List[Tuple[str, str, str]]:
+    # (name, url, channel_key)
+    return [
+        ("Reddit: FreeGameFindings", "https://www.reddit.com/r/FreeGameFindings/.rss", "games"),
+        ("Reddit: GameDeals", "https://www.reddit.com/r/GameDeals/.rss", "games"),
+        ("Reddit: freebies", "https://www.reddit.com/r/freebies/.rss", "software"),
+        ("Reddit: software", "https://www.reddit.com/r/software/.rss", "software"),
+        ("Humble Bundle", "https://www.humblebundle.com/rss", "games"),
+        ("Itch.io Bundles", "https://itch.io/bundles/rss", "games"),
+        ("Slickdeals Freebies", "https://slickdeals.net/freebies/rss", "software"),
+        ("Product Hunt", "https://www.producthunt.com/feed", "software"),
+        ("r/MachineLearning (for AI tools posts)", "https://www.reddit.com/r/MachineLearning/.rss", "ai"),
+        ("r/ArtificialInteligence", "https://www.reddit.com/r/ArtificialInteligence/.rss", "ai"),
+    ]
+
+HEADERS = {
+    "User-Agent": "FreeRadarBot/2.0 (+https://example.invalid)",
+    "Accept": "*/*",
+}
+
 async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+    async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
         resp.raise_for_status()
         return await resp.text()
 
-async def fetch_json(session: aiohttp.ClientSession, url: str) -> Any:
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
+    async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
         resp.raise_for_status()
-        return await resp.json(content_type=None)
+        return await resp.json()
 
-async def fetch_rss_listings(session: aiohttp.ClientSession, url: str, source_name: str) -> List[Listing]:
-    data = await fetch_text(session, url)
-    feed = feedparser.parse(data)
+async def parse_rss(session: aiohttp.ClientSession, name: str, url: str, channel_key: str) -> List[RadarItem]:
+    items: List[RadarItem] = []
+    try:
+        txt = await fetch_text(session, url)
+        feed = feedparser.parse(txt)
+        for e in feed.entries[:30]:
+            title = normalize(getattr(e, "title", "") or "")
+            link = normalize(getattr(e, "link", "") or "")
+            summary = normalize(getattr(e, "summary", "") or "")
+            if not title or not link:
+                continue
+            combo = f"{title} {summary}"
+            if not passes_global_filters(combo):
+                continue
+            items.append(RadarItem(
+                title=title,
+                url=link,
+                source=name,
+                channel_key=channel_key,
+                summary=summary[:400],
+                score=compute_score(title, summary),
+            ))
+    except Exception as ex:
+        log.warning("RSS failed: %s (%s)", name, ex)
+    return items
 
-    out: List[Listing] = []
-    for e in feed.entries:
-        title = getattr(e, "title", "").strip()
-        link = getattr(e, "link", "").strip()
-        published = (getattr(e, "published", "") or getattr(e, "updated", "") or "").strip()
-        summary = getattr(e, "summary", "") or getattr(e, "description", "") or ""
-        summary = re.sub(r"\s+", " ", str(summary)).strip()
+async def epic_free_games(session: aiohttp.ClientSession) -> List[RadarItem]:
+    items: List[RadarItem] = []
+    try:
+        data = await fetch_json(session, EPIC_FREE_GAMES_JSON)
+        elements = (((data or {}).get("data") or {}).get("Catalog") or {}).get("searchStore", {}).get("elements", [])
+        for el in elements:
+            promos = el.get("promotions")
+            if not promos:
+                continue
+            if not promos.get("promotionalOffers"):
+                continue
+            title = normalize(el.get("title", "") or "")
+            if not title:
+                continue
+            slug = None
+            for m in (el.get("catalogNs", {}).get("mappings") or []):
+                if m.get("pageType") == "productHome":
+                    slug = m.get("pageSlug")
+                    break
+            url = f"https://store.epicgames.com/p/{slug}" if slug else "https://store.epicgames.com/free-games"
+            summary = "Epic Games Store free promotion"
+            combo = f"{title} {summary}"
+            if not passes_global_filters(combo):
+                continue
+            items.append(RadarItem(
+                title=f"{title} (Epic Free)",
+                url=url,
+                source="Epic Games",
+                channel_key="games",
+                summary=summary,
+                score=compute_score(title, summary) + 10,
+            ))
+    except Exception as ex:
+        log.warning("Epic fetch failed: %s", ex)
+    return items
 
-        out.append(Listing(
-            title=title,
-            link=link,
-            published=published,
-            price=extract_price(title),
-            source=source_name,
-            extra=(summary[:900] if summary else None)
-        ))
-    return out
+# ----------------------------
+# Gmail ingestion (optional)
+# ----------------------------
+def gmail_enabled() -> bool:
+    return GMAIL_ENABLED and bool(GMAIL_TOKEN_JSON)
 
+def gmail_marketplace_items_sync() -> List[RadarItem]:
+    if not gmail_enabled():
+        return []
+    try:
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
 
-# ==========================================================
-# LOCAL: CRAIGSLIST
-# ==========================================================
-def craigslist_rss(zip_code: str, radius_miles: int) -> str:
-    params = {"postal": zip_code, "search_distance": radius_miles, "format": "rss"}
-    return f"{CRAIGSLIST_BASE}?{urlencode(params)}"
+        token = json.loads(GMAIL_TOKEN_JSON)
+        creds = Credentials.from_authorized_user_info(token)
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-async def fetch_craigslist(session: aiohttp.ClientSession, zip_code: str, radius_miles: int) -> List[Listing]:
-    url = craigslist_rss(zip_code, radius_miles)
-    data = await fetch_text(session, url)
-    feed = feedparser.parse(data)
+        resp = service.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
+        msgs = resp.get("messages", []) or []
 
-    out: List[Listing] = []
-    for e in feed.entries:
-        title = getattr(e, "title", "").strip()
-        link = getattr(e, "link", "").strip()
-        published = getattr(e, "published", "").strip()
+        out: List[RadarItem] = []
+        for m in msgs:
+            mid = m.get("id")
+            if not mid:
+                continue
+            msg = service.users().messages().get(userId="me", id=mid, format="metadata").execute()
+            headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", []) if "name" in h and "value" in h}
+            subject = normalize(headers.get("subject", "Facebook Marketplace alert"))
+            snippet = normalize(msg.get("snippet", ""))
 
-        where = None
-        if hasattr(e, "where"):
-            where = str(e.where)
-        elif hasattr(e, "dc_source"):
-            where = str(e.dc_source)
+            # Extract first Marketplace-ish URL from snippet (safe, avoids fetching full body)
+            found = re.findall(r"https?://\S+", snippet)
+            url = ""
+            for u in found:
+                u = u.strip(").,;]")
+                if "facebook.com" in u and ("marketplace" in u or "fb.me" in u):
+                    url = u
+                    break
+            if not url:
+                continue
 
-        out.append(Listing(
-            title=title,
-            link=link,
-            published=published,
-            where=where,
-            price=extract_price(title),
-            source="Craigslist (Free Stuff)",
-        ))
-    return out
+            combo = f"{subject} {snippet}"
+            if not passes_global_filters(combo):
+                continue
 
-
-# ==========================================================
-# ONLINE: STEAMDB (best-effort)
-# ==========================================================
-async def fetch_steamdb_free_promos(session: aiohttp.ClientSession) -> List[Listing]:
-    html = await fetch_text(session, STEAMDB_FREE_PROMOS_URL)
-    store_links = re.findall(r'href="(https?://store\.steampowered\.com/app/\d+[^"]*)"', html)
-
-    out: List[Listing] = []
-    for link in dict.fromkeys(store_links):
-        out.append(Listing(
-            title="[Steam] Free promotion (SteamDB)",
-            link=link,
-            price="FREE",
-            source="SteamDB Free Promotions",
-        ))
-    return out
-
-
-# ==========================================================
-# ONLINE: GAMERPOWER (Steam/Epic/GOG)
-# ==========================================================
-def gamerpower_url(platform: str) -> str:
-    params = {"platform": platform, "type": "game", "sort-by": "date"}
-    return f"{GAMERPOWER_API}/giveaways?{urlencode(params)}"
-
-async def fetch_gamerpower(session: aiohttp.ClientSession, platform: str) -> List[Listing]:
-    url = gamerpower_url(platform)
-    data = await fetch_json(session, url)
-
-    out: List[Listing] = []
-    if not isinstance(data, list):
+            out.append(RadarItem(
+                title=subject,
+                url=url,
+                source="Facebook (via Gmail)",
+                channel_key="local",
+                summary=snippet[:400],
+                score=compute_score(subject, snippet) + 5,
+            ))
         return out
+    except Exception as ex:
+        log.warning("Gmail ingestion failed: %s", ex)
+        return []
 
-    for g in data:
-        title = str(g.get("title", "")).strip()
-        link = str(g.get("open_giveaway_url") or g.get("giveaway_url") or "").strip()
-        end_date = str(g.get("end_date") or "").strip()
-        worth = str(g.get("worth") or "").strip()
-        platforms = str(g.get("platforms") or "").strip()
+# ----------------------------
+# Discord bot
+# ----------------------------
+INTENTS = discord.Intents.default()
+client = discord.Client(intents=INTENTS)
+tree = app_commands.CommandTree(client)
 
-        if not title or not link:
+async def ensure_category_and_channels(guild: discord.Guild) -> Dict[str, discord.TextChannel]:
+    category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(CATEGORY_NAME, reason="Free Radar setup")
+
+    async def get_or_create(name: str) -> discord.TextChannel:
+        ch = discord.utils.get(guild.text_channels, name=name, category=category)
+        if ch:
+            return ch
+        return await guild.create_text_channel(name, category=category, reason="Free Radar setup")
+
+    return {
+        "local": await get_or_create(CH_FREE_LOCAL),
+        "games": await get_or_create(CH_FREE_GAMES),
+        "software": await get_or_create(CH_FREE_SOFTWARE),
+        "ai": await get_or_create(CH_AI_TOOLS),
+        "requests": await get_or_create(CH_REQUESTS),
+        "claimed": await get_or_create(CH_CLAIMED),
+    }
+
+async def ensure_roles(guild: discord.Guild) -> Dict[str, discord.Role]:
+    roles: Dict[str, discord.Role] = {}
+    for name in (ROLE_LOCAL, ROLE_ONLINE):
+        r = discord.utils.get(guild.roles, name=name)
+        if r is None:
+            r = await guild.create_role(name=name, mentionable=True, reason="Free Radar setup")
+        roles[name] = r
+    return roles
+
+def channel_for_item(channels: Dict[str, discord.TextChannel], item: RadarItem) -> discord.TextChannel:
+    return channels.get(item.channel_key, channels["software"])
+
+def role_mention_for_item(roles: Dict[str, discord.Role], item: RadarItem) -> str:
+    return roles[ROLE_LOCAL].mention if item.channel_key == "local" else roles[ROLE_ONLINE].mention
+
+def build_embed(item: RadarItem) -> discord.Embed:
+    emb = discord.Embed(title=item.title[:250], url=item.url, description=(item.summary or "")[:2048])
+    emb.add_field(name="Source", value=item.source, inline=True)
+    emb.add_field(name="Score", value=str(item.score), inline=True)
+    return emb
+
+async def post_items(guild: discord.Guild, channels: Dict[str, discord.TextChannel], roles: Dict[str, discord.Role], items: List[RadarItem]) -> int:
+    posted = 0
+    items = sorted(items, key=lambda x: (-(x.score), x.title.lower()))
+    for it in items:
+        if already_posted(guild.id, it.url):
             continue
-
-        extra_bits = []
-        if platforms:
-            extra_bits.append(platforms)
-        if worth:
-            extra_bits.append(f"Worth: {worth}")
-        if end_date and end_date.lower() != "n/a":
-            extra_bits.append(f"Ends: {end_date}")
-
-        out.append(Listing(
-            title=f"[{platform}] {title}",
-            link=link,
-            source="GamerPower",
-            price="FREE",
-            extra=" | ".join(extra_bits) if extra_bits else None,
-        ))
-    return out
-
-
-# ==========================================================
-# ONLINE: REDDIT RSS
-# ==========================================================
-def reddit_rss(subreddit: str) -> str:
-    return f"https://www.reddit.com/r/{subreddit}/.rss"
-
-async def fetch_reddit_sub(session: aiohttp.ClientSession, subreddit: str) -> List[Listing]:
-    return await fetch_rss_listings(session, reddit_rss(subreddit), source_name=f"Reddit r/{subreddit}")
-
-
-# ==========================================================
-# GMAIL: Facebook Marketplace notifications via Gmail API
-# ==========================================================
-def gmail_get_service() -> Optional[Any]:
-    if not (GMAIL_ENABLED and GMAIL_TOKEN_JSON):
-        return None
-    try:
-        token_info = json.loads(GMAIL_TOKEN_JSON)
-        creds = Credentials.from_authorized_user_info(token_info, scopes=GMAIL_SCOPES)
-    except Exception:
-        return None
-
-    if creds and creds.expired and creds.refresh_token:
         try:
-            creds.refresh(Request())
-        except Exception:
-            return None
+            ping = role_mention_for_item(roles, it)
+            if watch_hit(guild.id, it):
+                ping += " 🔔"
+            await channel_for_item(channels, it).send(content=ping, embed=build_embed(it))
+            mark_posted(guild.id, it.url)
+            posted += 1
+            await asyncio.sleep(1.2)
+        except Exception as ex:
+            log.warning("Posting failed (%s): %s", guild.name, ex)
+    return posted
 
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+async def gather_all_items(session: aiohttp.ClientSession) -> List[RadarItem]:
+    tasks = []
 
-def gmail_extract_text(payload: Dict[str, Any]) -> str:
-    parts: List[str] = []
+    # Local (Craigslist free section)
+    tasks.append(parse_rss(session, "Craigslist Free", craigslist_free_rss(ZIP, RADIUS_MILES), "local"))
 
-    def walk(part: Dict[str, Any]):
-        mime = part.get("mimeType", "")
-        body = part.get("body", {}) or {}
-        data = body.get("data")
-        if data and mime in ("text/plain", "text/html"):
+    # Online (RSS feeds)
+    for name, url, key in rss_sources():
+        tasks.append(parse_rss(session, name, url, key))
+
+    # Online (Epic)
+    tasks.append(epic_free_games(session))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    items: List[RadarItem] = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        items.extend(r)
+
+    # Gmail (optional, blocking)
+    if gmail_enabled():
+        items.extend(await asyncio.to_thread(gmail_marketplace_items_sync))
+
+    # online sanity filter: prefer explicit free/giveaway cues
+    filtered: List[RadarItem] = []
+    for it in items:
+        text = (it.title + " " + it.summary).lower()
+        if it.channel_key == "local":
+            filtered.append(it)
+        else:
+            if any(k in text for k in ["free", "giveaway", "100% off", "claim", "free to keep", "limited time free"]):
+                filtered.append(it)
+    return filtered
+
+async def radar_loop():
+    await client.wait_until_ready()
+    log.info("Free Radar online as %s", client.user)
+
+    async with aiohttp.ClientSession() as session:
+        last_local = 0.0
+        last_online = 0.0
+        last_gmail = 0.0
+
+        while not client.is_closed():
+            now = time.time()
             try:
-                decoded = base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="ignore")
-                parts.append(decoded)
-            except Exception:
-                pass
-        for p in part.get("parts", []) or []:
-            walk(p)
+                if (now - last_online) >= ONLINE_INTERVAL:
+                    last_online = now
+                    items = await gather_all_items(session)
+                    for guild in client.guilds:
+                        channels = await ensure_category_and_channels(guild)
+                        roles = await ensure_roles(guild)
+                        n = await post_items(guild, channels, roles, items)
+                        if n:
+                            log.info("Posted %s item(s) to %s", n, guild.name)
 
-    walk(payload)
-    return "\n".join(parts)
+                # local heartbeat
+                if (now - last_local) >= LOCAL_INTERVAL:
+                    last_local = now
+                    local_items = await parse_rss(session, "Craigslist Free", craigslist_free_rss(ZIP, RADIUS_MILES), "local")
+                    for guild in client.guilds:
+                        channels = await ensure_category_and_channels(guild)
+                        roles = await ensure_roles(guild)
+                        n = await post_items(guild, channels, roles, local_items)
+                        if n:
+                            log.info("Posted %s local item(s) to %s", n, guild.name)
 
-def gmail_header(headers: List[Dict[str, str]], name: str) -> str:
-    for h in headers:
-        if h.get("name", "").lower() == name.lower():
-            return h.get("value", "")
-    return ""
+                # gmail heartbeat (optional)
+                if gmail_enabled() and (now - last_gmail) >= GMAIL_INTERVAL:
+                    last_gmail = now
+                    gmail_items = await asyncio.to_thread(gmail_marketplace_items_sync)
+                    for guild in client.guilds:
+                        channels = await ensure_category_and_channels(guild)
+                        roles = await ensure_roles(guild)
+                        n = await post_items(guild, channels, roles, gmail_items)
+                        if n:
+                            log.info("Posted %s Gmail item(s) to %s", n, guild.name)
 
-def gmail_find_marketplace_link(text: str) -> Optional[str]:
-    m = FB_MARKET_ITEM_RE.search(text)
-    if m:
-        return m.group(0)
-    m2 = FB_REDIRECT_RE.search(text)
-    if m2:
-        return m2.group(0)
-    return None
+            except Exception as ex:
+                log.warning("Loop error: %s", ex)
 
-def gmail_fetch_marketplace_listings(service: Any, max_messages: int = 10) -> List[Listing]:
-    results: List[Listing] = []
-    try:
-        resp = service.users().messages().list(
-            userId="me",
-            q=GMAIL_QUERY,
-            maxResults=max_messages
-        ).execute()
-    except HttpError as e:
-        print(f"[GMAIL] list error: {e}")
-        return results
+            await asyncio.sleep(10)
 
-    msg_refs = resp.get("messages", []) or []
-    for ref in msg_refs:
-        msg_id = ref.get("id")
-        if not msg_id:
-            continue
-
-        try:
-            msg = service.users().messages().get(
-                userId="me",
-                id=msg_id,
-                format="full"
-            ).execute()
-        except HttpError as e:
-            print(f"[GMAIL] get error: {e}")
-            continue
-
-        payload = msg.get("payload", {}) or {}
-        headers = payload.get("headers", []) or []
-        subject = gmail_header(headers, "Subject") or "Facebook Marketplace alert"
-        datev = gmail_header(headers, "Date") or ""
-
-        text = gmail_extract_text(payload)
-        link = gmail_find_marketplace_link(text)
-        if not link:
-            continue
-
-        results.append(Listing(
-            title=subject,
-            link=link,
-            published=datev,
-            price="FREE?",
-            source="Facebook Marketplace (Gmail alerts)",
-        ))
-
-    return results
-
-
-# ==========================================================
-# DISCORD BOT
-# ==========================================================
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-def user_can_setup(interaction: discord.Interaction) -> bool:
-    perms = interaction.user.guild_permissions
-    return perms.manage_guild or perms.administrator
-
-async def ensure_role(guild: discord.Guild, name: str) -> discord.Role:
-    role = discord.utils.get(guild.roles, name=name)
-    if role:
-        return role
-    return await guild.create_role(name=name, reason="Freebie Radar setup")
-
-async def ensure_category(guild: discord.Guild, name: str) -> discord.CategoryChannel:
-    cat = discord.utils.get(guild.categories, name=name)
-    if cat:
-        return cat
-    return await guild.create_category(name=name, reason="Freebie Radar setup")
-
-async def ensure_text_channel(guild: discord.Guild, category: discord.CategoryChannel, name: str, topic: str) -> discord.TextChannel:
-    ch = discord.utils.get(guild.text_channels, name=name)
-    if ch:
-        if ch.category_id != category.id:
-            await ch.edit(category=category, reason="Freebie Radar setup: move channel")
-        if (ch.topic or "") != topic:
-            await ch.edit(topic=topic, reason="Freebie Radar setup: update topic")
-        return ch
-    return await guild.create_text_channel(name=name, category=category, topic=topic, reason="Freebie Radar setup")
-
-@bot.event
-async def on_ready():
-    init_db()
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user} ({bot.user.id})")
-    if not poll_local.is_running():
-        poll_local.start()
-    if not poll_online.is_running():
-        poll_online.start()
-    if GMAIL_ENABLED and not poll_gmail.is_running():
-        poll_gmail.start()
-
-@bot.tree.command(name="setup", description="Create Freebie Radar channels + ping roles.")
-@app_commands.describe(zip_code="Zip code (default 95673)", radius_miles="Radius miles (default 20)")
-async def setup(interaction: discord.Interaction, zip_code: Optional[str] = None, radius_miles: Optional[int] = None):
+# ----------------------------
+# Slash commands
+# ----------------------------
+@tree.command(name="setup", description="Create Free Radar channels + ping roles in this server.")
+async def setup(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
-    if not user_can_setup(interaction):
-        return await interaction.response.send_message("You need Manage Server (or Admin) to run setup.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need Manage Server to run setup.", ephemeral=True)
 
-    me = interaction.guild.me
-    if not me.guild_permissions.manage_channels or not me.guild_permissions.manage_roles:
-        return await interaction.response.send_message("I need Manage Channels + Manage Roles to do setup.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await ensure_category_and_channels(interaction.guild)
+    await ensure_roles(interaction.guild)
+    await interaction.followup.send("✅ Free Radar is set up. Channels + roles created.", ephemeral=True)
 
-    await interaction.response.defer(ephemeral=True)
+@tree.command(name="scan", description="Run a manual scan now (posts new items).")
+async def scan(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
 
-    zip_code = (zip_code or DEFAULT_ZIP).strip()
-    radius_miles = int(radius_miles or DEFAULT_RADIUS_MILES)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    async with aiohttp.ClientSession() as session:
+        items = await gather_all_items(session)
+    channels = await ensure_category_and_channels(interaction.guild)
+    roles = await ensure_roles(interaction.guild)
+    n = await post_items(interaction.guild, channels, roles, items)
+    await interaction.followup.send(f"📡 Scan complete. Posted {n} new item(s).", ephemeral=True)
 
-    local_role = await ensure_role(interaction.guild, ROLE_LOCAL)
-    online_role = await ensure_role(interaction.guild, ROLE_ONLINE)
-    category = await ensure_category(interaction.guild, SETUP_CATEGORY_NAME)
+@tree.command(name="watch", description="Add a keyword to this server's watchlist (adds 🔔).")
+@app_commands.describe(keyword="Example: couch, bike, laptop, server, ps5")
+async def watch(interaction: discord.Interaction, keyword: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
+    kw = keyword.strip().lower()
+    if len(kw) < 2:
+        return await interaction.response.send_message("Keyword too short.", ephemeral=True)
+    add_watch(interaction.guild.id, kw)
+    await interaction.response.send_message(f"✅ Added watch keyword: **{kw}**", ephemeral=True)
 
-    created_channels: Dict[str, int] = {}
-    for cname, topic in CHANNELS_TO_CREATE:
-        ch = await ensure_text_channel(interaction.guild, category, cname, topic)
-        created_channels[cname] = ch.id
-
-    upsert_guild_config(
-        guild_id=interaction.guild.id,
-        zip_code=zip_code,
-        radius_miles=radius_miles,
-        category_id=category.id,
-        channel_local_id=created_channels["free-local"],
-        channel_online_id=created_channels["free-online"],
-        role_local_id=local_role.id,
-        role_online_id=online_role.id,
-    )
-
-    await interaction.followup.send(
-        "Setup complete ✅\n"
-        f"- Category: **{SETUP_CATEGORY_NAME}**\n"
-        f"- Roles: **{ROLE_LOCAL}**, **{ROLE_ONLINE}**\n"
-        "- Channels: **#free-local**, **#free-online**, **#requests**, **#claimed-and-dead**\n\n"
-        "If pings don’t work: move the bot’s role above the Freebie Radar roles (Server Settings → Roles).",
+@tree.command(name="unwatch", description="Remove a keyword from this server's watchlist.")
+@app_commands.describe(keyword="Keyword to remove")
+async def unwatch(interaction: discord.Interaction, keyword: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
+    kw = keyword.strip().lower()
+    ok = remove_watch(interaction.guild.id, kw)
+    await interaction.response.send_message(
+        (f"🗑️ Removed watch keyword: **{kw}**" if ok else f"Couldn't find **{kw}** in the watchlist."),
         ephemeral=True
     )
 
-@bot.tree.command(name="addrss", description="Add a custom RSS feed watched for online freebies.")
-@app_commands.describe(feed_url="RSS feed URL")
-async def addrss(interaction: discord.Interaction, feed_url: str):
+@tree.command(name="watchlist", description="Show this server's watchlist.")
+async def watchlist(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
-    if not user_can_setup(interaction):
-        return await interaction.response.send_message("You need Manage Server (or Admin) to add feeds.", ephemeral=True)
+    wl = get_watchlist(interaction.guild.id)
+    if not wl:
+        return await interaction.response.send_message("No watch keywords yet. Use `/watch`.", ephemeral=True)
+    await interaction.response.send_message("🔎 Watchlist:\n" + "\n".join(f"- {k}" for k in wl), ephemeral=True)
 
-    feed_url = feed_url.strip()
-    if not (feed_url.startswith("http://") or feed_url.startswith("https://")):
-        return await interaction.response.send_message("That doesn’t look like a URL.", ephemeral=True)
-
-    add_custom_rss(interaction.guild.id, feed_url)
-    await interaction.response.send_message("Added ✅ (will post into #free-online)", ephemeral=True)
-
-@bot.tree.command(name="listrss", description="List custom RSS feeds watched for online freebies.")
-async def listrss(interaction: discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
-    feeds = list_custom_rss(interaction.guild.id)
-    if not feeds:
-        return await interaction.response.send_message("No custom feeds added yet.", ephemeral=True)
-    msg = "Custom RSS feeds:\n" + "\n".join(f"- {f}" for f in feeds[:25])
-    if len(feeds) > 25:
-        msg += f"\n…and {len(feeds) - 25} more."
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-# ==========================================================
-# POLLERS
-# ==========================================================
-@tasks.loop(seconds=POLL_SECONDS_LOCAL)
-async def poll_local():
-    configs = get_all_guild_configs()
-    if not configs:
-        return
-
+@client.event
+async def on_ready():
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": "VioletFreebieRadar/1.0"}) as session:
-            for cfg in configs:
-                guild_id = cfg["guild_id"]
-                channel_id = cfg["channel_local_id"]
-                role_id = cfg["role_local_id"]
+        await tree.sync()
+        log.info("Slash commands synced.")
+    except Exception as ex:
+        log.warning("Slash command sync failed: %s", ex)
 
-                channel = bot.get_channel(channel_id) if channel_id else None
-                if not isinstance(channel, discord.TextChannel):
-                    continue
-
-                listings = await fetch_craigslist(session, cfg["zip"], cfg["radius_miles"])
-                for item in listings:
-                    if not item.link:
-                        continue
-                    if already_seen(guild_id, "craigslist_local", item.link):
-                        continue
-                    if not passes_filters(f"{item.title} {item.where or ''}"):
-                        mark_seen(guild_id, "craigslist_local", item.link)
-                        continue
-
-                    await channel.send(
-                        content=(f"<@&{role_id}>" if role_id else ""),
-                        embed=make_embed(item),
-                    )
-                    mark_seen(guild_id, "craigslist_local", item.link)
-                    await asyncio.sleep(1.0)
-    except Exception as e:
-        print(f"[LOCAL] error: {e}")
-
-@tasks.loop(seconds=POLL_SECONDS_ONLINE)
-async def poll_online():
-    configs = get_all_guild_configs()
-    if not configs:
-        return
-
-    try:
-        async with aiohttp.ClientSession(headers={"User-Agent": "VioletFreebieRadar/1.0"}) as session:
-            gp_steam = await fetch_gamerpower(session, "steam")
-            gp_epic = await fetch_gamerpower(session, "epic-games-store")
-            gp_gog = await fetch_gamerpower(session, "gog")
-            steamdb = await fetch_steamdb_free_promos(session)
-
-            reddit_items: List[Listing] = []
-            for sub in DEFAULT_REDDIT_SUBS:
-                try:
-                    reddit_items.extend(await fetch_reddit_sub(session, sub))
-                    await asyncio.sleep(0.2)
-                except Exception:
-                    pass
-
-            tech_items: List[Listing] = []
-            for feed_url in DEFAULT_TECH_RSS:
-                try:
-                    tech_items.extend(await fetch_rss_listings(session, feed_url, source_name="Tech/Freebies RSS"))
-                    await asyncio.sleep(0.2)
-                except Exception:
-                    pass
-
-            for cfg in configs:
-                guild_id = cfg["guild_id"]
-                channel_id = cfg["channel_online_id"]
-                role_id = cfg["role_online_id"]
-
-                channel = bot.get_channel(channel_id) if channel_id else None
-                if not isinstance(channel, discord.TextChannel):
-                    continue
-
-                custom_items: List[Listing] = []
-                for feed_url in list_custom_rss(guild_id):
-                    try:
-                        custom_items.extend(await fetch_rss_listings(session, feed_url, source_name="Custom RSS"))
-                        await asyncio.sleep(0.2)
-                    except Exception:
-                        pass
-
-                buckets = [
-                    ("gp_steam", gp_steam),
-                    ("gp_epic", gp_epic),
-                    ("gp_gog", gp_gog),
-                    ("steamdb_free", steamdb),
-                    ("reddit", reddit_items),
-                    ("tech_rss", tech_items),
-                    ("custom_rss", custom_items),
-                ]
-
-                for feed_type, items in buckets:
-                    for item in items:
-                        if not item.link:
-                            continue
-                        if already_seen(guild_id, feed_type, item.link):
-                            continue
-                        if not passes_filters(f"{item.title} {item.extra or ''} {item.source or ''}"):
-                            mark_seen(guild_id, feed_type, item.link)
-                            continue
-
-                        await channel.send(
-                            content=(f"<@&{role_id}>" if role_id else ""),
-                            embed=make_embed(item),
-                        )
-                        mark_seen(guild_id, feed_type, item.link)
-                        await asyncio.sleep(0.8)
-    except Exception as e:
-        print(f"[ONLINE] error: {e}")
-
-@tasks.loop(seconds=POLL_SECONDS_GMAIL)
-async def poll_gmail():
-    if not GMAIL_ENABLED:
-        return
-
-    service = gmail_get_service()
-    if service is None:
-        print("[GMAIL] Missing/invalid GMAIL_TOKEN_JSON or GMAIL_ENABLED not set.")
-        return
-
-    configs = get_all_guild_configs()
-    if not configs:
-        return
-
-    try:
-        items = gmail_fetch_marketplace_listings(service, max_messages=10)
-        if not items:
-            return
-
-        for cfg in configs:
-            guild_id = cfg["guild_id"]
-            channel_id = cfg["channel_local_id"]
-            role_id = cfg["role_local_id"]
-
-            channel = bot.get_channel(channel_id) if channel_id else None
-            if not isinstance(channel, discord.TextChannel):
-                continue
-
-            for item in items:
-                if already_seen(guild_id, "facebook_gmail", item.link):
-                    continue
-
-                if not passes_filters(item.title):
-                    mark_seen(guild_id, "facebook_gmail", item.link)
-                    continue
-
-                await channel.send(
-                    content=(f"<@&{role_id}>" if role_id else ""),
-                    embed=make_embed(item),
-                )
-                mark_seen(guild_id, "facebook_gmail", item.link)
-                await asyncio.sleep(0.8)
-
-    except Exception as e:
-        print(f"[GMAIL] error: {e}")
-
-
-if __name__ == "__main__":
+def main():
     if not DISCORD_TOKEN:
         raise SystemExit("Missing DISCORD_TOKEN env var.")
-    bot.run(DISCORD_TOKEN)
+    _ = db()
+    client.loop.create_task(radar_loop())
+    client.run(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    main()

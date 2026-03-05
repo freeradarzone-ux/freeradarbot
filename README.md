@@ -1,66 +1,59 @@
-#  Freebie Radar (Discord Bot)
+# Free Radar (Discord Bot) - V2 Upgrade
 
-All-in-one Discord bot that posts:
-- Local freebies: Craigslist Free Stuff near a ZIP within a radius
-- Online freebies: Steam/Epic/GOG (GamerPower), Steam promos (SteamDB best-effort), Reddit RSS, Tech/Freebies RSS
-- Optional: Facebook Marketplace alerts via Gmail API (reads your Marketplace notification emails)
+Free Radar posts:
+- **Local pickups:** Craigslist free section (ZIP + radius)
+- **Online freebies:** RSS feeds (Reddit/Humble/Itch/Slickdeals/ProductHunt + AI subs) + Epic free promos JSON
+- **Optional:** Facebook Marketplace alerts via **Gmail notifications** (no scraping)
 
-## 1) Create your Discord Bot + Token
-1. Discord Developer Portal -> New Application
-2. Bot -> Add Bot -> Reset/Copy Token
-3. OAuth2 -> URL Generator:
-   - Scopes: bot, applications.commands
-   - Bot Permissions: Manage Channels, Manage Roles, Send Messages, Embed Links
-4. Invite bot to your server.
-5. Server Settings -> Roles -> move the bot's role ABOVE the Freebie Radar roles.
+## Deploy (GitHub + Railway)
+1. Upload these files to a GitHub repo
+2. Railway -> New Project -> Deploy from GitHub
+3. Add Railway Variables:
+   - DISCORD_TOKEN = your bot token
+   - ZIP = 95673
+   - RADIUS_MILES = 20
 
-## 2) GitHub
-Create a repo and upload these files:
-- bot.py
-- requirements.txt
-- make_token.py
-- README.md
-- .gitignore
+Included:
+- `Procfile` -> Railway worker starts `python bot.py`
+- `runtime.txt` -> pins Python 3.12 to avoid Python 3.13 `audioop` removal issue.
 
-## 3) Railway Deploy
-Railway -> New Project -> Deploy from GitHub Repo -> select your repo
+## Discord (first run)
+- `/setup` creates channels + ping roles
+- `/scan` triggers a scan immediately
 
-Railway -> Variables:
-- DISCORD_TOKEN = your bot token
-- ZIP = 95673
-- RADIUS_MILES = 20
+Roles created (mentionable):
+- Free Radar Local
+- Free Radar Online
 
-Optional filters:
-- INCLUDE_KEYWORDS = comma,separated,keywords
-- EXCLUDE_KEYWORDS = comma,separated,keywords
+Channels created under category "Free Radar":
+- #free-local
+- #free-games
+- #free-software
+- #ai-tools
+- #requests
+- #claimed-and-dead
 
-## 4) Discord Setup
-After deploy, in your Discord server run:
-- /setup
+## Watchlist (per server)
+- `/watch couch`
+- `/watch bike`
+- `/watch laptop`
+- `/watchlist`
+- `/unwatch couch`
 
-Creates:
-- Category: Freebie Radar
-- Channels: #free-local, #free-online, #requests, #claimed-and-dead
-- Roles: Freebie Radar Local, Freebie Radar Online
+Watch hits add an extra 🔔 next to the ping.
 
-## 5) Optional Gmail + Facebook Marketplace Alerts (Safe / Official)
-This does NOT scrape Marketplace. It reads your Facebook Marketplace notification emails in Gmail via Gmail API.
+## Optional Gmail Marketplace ingestion
+This reads your Gmail inbox for Facebook Marketplace notification emails.
+It does NOT scrape Facebook.
 
-Facebook:
-- Enable Marketplace email notifications
-- Save searches so emails are sent
+### Steps
+1) Google Cloud Console -> create project -> enable Gmail API  
+2) Create OAuth Client ID (Desktop app) and download JSON  
+3) Save it next to `make_token.py` as `oauth_client.json`  
+4) Run: `python make_token.py`  
+5) Paste output into Railway variable `GMAIL_TOKEN_JSON`  
+6) Set Railway variable: `GMAIL_ENABLED=1`  
+7) (Optional) customize `GMAIL_QUERY`
 
-Gmail API token (one-time on your PC):
-1) In Google Cloud Console:
-   - Enable Gmail API
-   - Create OAuth Client ID: Desktop app
-   - Download JSON as oauth_client.json next to make_token.py
-2) Run locally:
-   - pip install -r requirements.txt
-   - python make_token.py
-3) Set Railway Variables:
-   - GMAIL_ENABLED = 1
-   - GMAIL_TOKEN_JSON = (paste the printed JSON)
-   - GMAIL_QUERY = from:facebookmail.com (marketplace OR subject:Marketplace) newer_than:14d
-
-Redeploy. Marketplace alerts will post into #free-local.
+Default query:
+`from:facebookmail.com (marketplace OR subject:Marketplace) newer_than:14d`
