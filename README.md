@@ -1,4 +1,4 @@
-# Violet Freebie Radar (Discord Bot)
+#  Freebie Radar (Discord Bot)
 
 All-in-one Discord bot that posts:
 - Local freebies: Craigslist Free Stuff near a ZIP within a radius
